@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+action=$1
+target=$2
+args=$@
+
+CE_BASE=/opt
+
+source ${CE_BASE}/cloudexplorer/.env
+
+export COMPOSE_HTTP_TIMEOUT=180
+
+declare compose_files="-f ${CE_BASE}/cloudexplorer/docker-compose.yml -f ${CE_BASE}/cloudexplorer/apps/docker-compose-core.yml"
+
+if [[ "${CE_EXTERNAL_MYSQL}" == "false" ]]; then
+   compose_files="${compose_files} -f ${CE_BASE}/cloudexplorer/docker-compose-mysql.yml"
+fi
+
+if [[ "${CE_EXTERNAL_REDIS}" == "false" ]]; then
+   compose_files="${compose_files} -f ${CE_BASE}/cloudexplorer/docker-compose-redis.yml"
+fi
+
+if [[ "${CE_EXTERNAL_ELASTICSEARCH}" == "false" ]]; then
+   compose_files="${compose_files} -f ${CE_BASE}/cloudexplorer/docker-compose-elasticsearch.yml"
+fi
+
+if [[ "${CE_EXTERNAL_LOGSTASH}" == "false" ]]; then
+   compose_files="${compose_files} -f ${CE_BASE}/cloudexplorer/docker-compose-logstash.yml"
+fi
+
+if [[ "${CE_KIBANA_ENABLE}" == "true" ]]; then
+   compose_files="${compose_files} -f ${CE_BASE}/cloudexplorer/docker-compose-kibana.yml"
+fi
+
+
+#docker compose v1 v2版本命令不同
+docker_compose_command="docker-compose"
+docker-compose version &>/dev/null
+if [ $? -ne 0 ]; then
+  docker_compose_command="docker compose"
+  docker compose version &>/dev/null
+  if [ $? -ne 0 ]; then
+    echo "docker compose 未安装"
+    exit 1
+  fi
+fi
+
+# todo mysql/redis/es 外部安装
+
+
+function usage() {
+   echo "CloudExplorer 控制脚本"
+   echo
+   echo "Usage: "
+   echo "  ./cectl [COMMAND] [ARGS...]"
+   echo "  ./cectl --help"
+   echo
+   echo "Commands: "
+   echo "  status       查看 CloudExplorer 服务运行状态"
+   echo "  start        启动 CloudExplorer 服务"
+   echo "  stop         停止 CloudExplorer 服务"
+   echo "  restart      重启 CloudExplorer 服务"
+   echo "  reload       重新加载 CloudExplorer 服务"
+   echo "  uninstall    卸载 CloudExplorer 服务"
+   echo "  upgrade      升级 CloudExplorer 服务"
+   echo "  version      查看 CloudExplorer 版本信息"
+#   echo "  clear-logs   清理 CloudExplorer 历史日志"
+}
+
+function version() {
+   cat ${CE_BASE}/cloudexplorer/VERSION
+}
+
+function psCore(){
+   docker exec cloudexplorer run-core ps
+}
+
+
+function _healthcheck() {
+   echo
+   sleep 3
+   for b in {1..50}
+   do
+      eureka_arr=(`psCore | grep "x eureka pid:"`)
+      if [ $? -ne 0 ]; then
+        echo -e "\nCloudExplorer 服务状态 : 未运行"
+        exit 1
+      fi
+      gateway_arr=(`psCore | grep "x gateway pid:"`)
+      management_center_arr=(`psCore | grep "x management-center pid:"`)
+
+      if [[ ${eureka_arr[2]} == "pid:" || ( ${gateway_arr[2]} == "pid:" && ${management_center_arr[3]} == "status:healthy" ) || ${management_center_arr[2]} == "pid:" ]]; then
+        echo -e "\nCloudExplorer 服务状态 : \033[31m无法访问\033[0m"
+        exit 1
+      fi
+
+       _temp_status="eureka(${eureka_arr[3]})  gateway(${gateway_arr[3]})  management_center(${management_center_arr[3]})"
+
+      if [[ ${eureka_arr[3]} == "status:healthy" && ${gateway_arr[3]} == "status:healthy" && ${management_center_arr[3]} == "status:healthy" ]]; then
+        echo -e "\nCloudExplorer 服务状态 : 正常运行          ${_temp_status}                     "
+        break;
+      else
+
+        echo -en "\rCloudExplorer 服务状态 : 正在启动          ${_temp_status}                     "
+        sleep 1
+        echo -en "\rCloudExplorer 服务状态 : 正在启动.         ${_temp_status}                     "
+        sleep 1
+        echo -en "\rCloudExplorer 服务状态 : 正在启动..        ${_temp_status}                     "
+        sleep 1
+        echo -en "\rCloudExplorer 服务状态 : 正在启动...       ${_temp_status}                     "
+        sleep 1
+        echo -en "\rCloudExplorer 服务状态 : 正在启动....      ${_temp_status}                     "
+        sleep 1
+        echo -en "\rCloudExplorer 服务状态 : 正在启动.....     ${_temp_status}                     "
+        sleep 1
+        echo -en "\rCloudExplorer 服务状态 : 正在启动......    ${_temp_status}                     "
+
+      fi
+   done
+   echo
+}
+function ps(){
+   echo
+   echo "CloudExplorer 容器运行状态"
+   ${docker_compose_command} ${compose_files} ps ${target}
+   psCore
+}
+
+function status() {
+
+   ps
+
+   echo
+   docker_root_dir=$(docker info | grep "Docker Root Dir"  | awk -F': ' '{print $2}')
+   echo "Docker 目录及文件大小 : "
+   du -sh $docker_root_dir
+   echo
+   echo "Docker 目录所在磁盘使用情况 : "
+   df -H $docker_root_dir
+
+   echo
+   echo "日志文件大小 : "
+   du -Sh ${CE_BASE}/cloudexplorer/logs/
+
+   echo
+   echo "CloudExplorer 运行目录及文件大小 : "
+   du -sh ${CE_BASE}
+   echo
+   echo "CloudExplorer 运行目录使用情况 : "
+   df -H ${CE_BASE}
+
+   echo
+   read available_disk percent_disk<<< $(df -H --output=avail,pcent ${CE_BASE} | tail -1)
+   available_disk=${available_disk%?}
+   percent_disk=${percent_disk%?}
+   if [[ $available_disk < 2.0 ]] && [[ $percent_disk > 85 ]];then
+      echo -e "\033[31m[警告] CloudExplorer 运行目录所在磁盘剩余空间不足 2G 且磁盘使用率超过 85%，CloudExplorer 可能无法正常启动!\033[0m"
+   fi
+
+   _healthcheck
+}
+function start() {
+   echo
+   cd ${CE_BASE}/cloudexplorer; ${docker_compose_command} ${compose_files} start ${target}
+   _healthcheck
+}
+function stop() {
+   echo
+   cd ${CE_BASE}/cloudexplorer; ${docker_compose_command} ${compose_files} stop ${target}
+}
+function restart() {
+   echo
+   cd ${CE_BASE}/cloudexplorer; ${docker_compose_command} ${compose_files} restart ${target}
+   _healthcheck
+}
+function reload() {
+   echo
+   cd ${CE_BASE}/cloudexplorer; ${docker_compose_command} ${compose_files} up -d
+   _healthcheck
+}
+function uninstall() {
+   echo
+   cd ${CE_BASE}/cloudexplorer; ${docker_compose_command} ${compose_files} down -v ${target}
+}
+function pull() {
+   echo
+   cd ${CE_BASE}/cloudexplorer; ${docker_compose_command} ${compose_files} pull
+}
+
+function clear_logs() {
+   echo "开始清理 CloudExplorer 历史日志"
+   rm -rf ${CE_BASE}/cloudexplorer/logs/cloudexplorer/history/*
+   echo "清理完毕"
+
+}
+
+function upgrade() {
+   echo
+      git_urls=('gitee.com' 'github.com')
+      if [[ -x "$(command -v python)" ]];then
+         py_cmd='python'
+      elif [[ -x "$(command -v python3)" ]]; then
+         py_cmd='python3'
+      else
+         git_urls=('github.com')
+      fi
+
+      for git_url in ${git_urls[*]}
+      do
+         success="true"
+         for i in {1..3}
+         do
+            echo -ne "检测 ${git_url} ... ${i} "
+            curl -m 5 -kIs https://${git_url} >/dev/null
+            if [ $? != 0 ];then
+               echo "failed"
+               success="false"
+               break
+            else
+               echo "ok"
+            fi
+         done
+         if [[ ${success} == "true" ]];then
+            server_url=${git_url}
+            break
+         fi
+      done
+
+      if [[ "x${server_url}" == "x" ]];then
+         echo "没有找到稳定的下载服务器，请稍候重试"
+         exit 1
+      fi
+
+      if [[ "${server_url}" == "gitee.com" ]];then
+         owner='fit2cloud-feizhiyun'
+         repo='CloudExplorer-Lite'
+         #gitee_release_content=$(curl -s https://gitee.com/api/v5/repos/${owner}/${repo}/releases/latest)
+         export LC_ALL="en_US.utf8"
+         latest_version=$(curl -s https://gitee.com/api/v5/repos/${owner}/${repo}/releases/latest | $py_cmd -m json.tool | grep -e "\"tag_name\"" | sed -r 's/.*: "(.*)",/\1/')
+         #latest_version=$($py_cmd -c "import json; obj=json.loads('$gitee_release_content', strict=False); print(obj['tag_name']);")
+      else
+         owner='CloudExplorer-Dev'
+         repo='CloudExplorer-Lite'
+         latest_version=$(curl -s https://api.github.com/repos/${owner}/${repo}/releases/latest | grep -e "\"tag_name\"" | sed -r 's/.*: "(.*)",/\1/')
+      fi
+
+
+   if [ "${latest_version}" = "" ];then
+         echo "未获取到最新版本"
+         exit 1
+   fi
+
+   current_version=`cat ${CE_BASE}/cloudexplorer/VERSION`
+
+   baseDownloadUrl=https://resource.fit2cloud.com/cloudexplorer-lite/installer/releases
+
+   if [[ "${latest_version}" != "${current_version}" ]];
+   then
+     read -r -p "当前版本为 ${current_version} ,检测到最新版本为 ${latest_version} ,确定升级? [Y/n] " input
+     case $input in
+      [yY][eE][sS]|[yY])
+         echo "Yes"
+         download_package_url=${baseDownloadUrl}/${latest_version}/cloudexplorer-online-installer-${latest_version}.tar.gz
+
+         package_name=cloudexplorer-online-installer-${latest_version}-$RANDOM
+
+         curl ${download_package_url} -o /tmp/${package_name}.tar.gz || exit
+
+         mkdir -p /tmp/${package_name}
+j
+         tar -xzvf /tmp/${package_name}.tar.gz -C /tmp/${package_name}
+
+         cd /tmp/${package_name}/cloudexplorer-online-installer-${latest_version}
+
+         /usr/bin/env bash install.sh
+
+         ;;
+      [nN][oO]|[nN])
+         echo "No"
+         exit 0;
+         ;;
+
+      *)
+         echo "Invalid input..."
+         exit 1
+         ;;
+      esac
+   else
+     echo "不需要升级";
+     exit 0;
+   fi
+}
+
+function main() {
+    case "${action}" in
+      ps)
+         ps
+         ;;
+      status)
+         status
+         ;;
+      start)
+         start
+         ;;
+      stop)
+         stop
+         ;;
+      restart)
+         restart
+         ;;
+      reload)
+         reload
+         ;;
+      uninstall)
+         uninstall
+         ;;
+      upgrade)
+         upgrade
+         ;;
+      version)
+         version
+         ;;
+      clear-logs)
+         clear_logs
+         ;;
+      pull)
+         pull
+         ;;
+      help)
+         usage
+         ;;
+      --help)
+         usage
+         ;;
+      *)
+         echo "不支持的参数，请使用 help 或 --help 参数获取帮助"
+    esac
+}
+main
